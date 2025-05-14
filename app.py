@@ -134,7 +134,7 @@ elif page == "Lead Finder":
 
                 for state in states:
                     for term in search_terms:
-                        query_results = search_places(term, f"{term} in {state}", API_KEY)
+                        query_results = search_places(term, f"{state}", API_KEY)
                         st.session_state.api_calls += 1
                         for result in query_results:
                             place_id = result.get("place_id")
