@@ -6,6 +6,10 @@ import re
 import time
 import io
 
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
 st.set_page_config(page_title="Email Scraper", layout="wide")
 
 st.markdown("""
@@ -93,9 +97,7 @@ elif page == "Lead Finder":
         if not business_type or not states:
             st.warning("Please enter a business type and select at least one state.")
         else:
-            import os
-
-            API_KEY = os.getenv("GOOGLE_API_KEY") or "AIzaSyDUI3NB0HF8f64Y4D1_fg0ix6HgQvee69U"  # Replace if needed
+            API_KEY = os.getenv("GOOGLE_API_KEY")
 
             def search_places(query, location, api_key):
                 url = f"https://maps.googleapis.com/maps/api/place/textsearch/json"
