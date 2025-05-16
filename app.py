@@ -1,12 +1,15 @@
 import streamlit as st
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
 import re
 import time
 import io
 import os
+import hashlib
+import json
 from dotenv import load_dotenv
+from search import search_places, get_place_details
+from enrich import scrape_contact_info_from_site, extract_email_from_text, extract_name_and_title_from_text
 load_dotenv()
 
 # --- Persistent API usage tracking ---
@@ -36,7 +39,6 @@ st.set_page_config(page_title="Direct Contact Search")
 
 PAGES = {
     "Lead Finder": "🔍 Lead Finder",
-    "Email Scraper": "📇 Direct Contact Search",
     "Instructions": "❓ Help"
 }
 
@@ -51,8 +53,6 @@ if "page" not in st.session_state:
 
 if st.sidebar.button("🔍 Lead Finder"):
     st.session_state.page = "Lead Finder"
-if st.sidebar.button("📇 Direct Contact Search"):
-    st.session_state.page = "Email Scraper"
 if st.sidebar.button("❓ Help"):
     st.session_state.page = "Instructions"
 
@@ -109,6 +109,11 @@ if page == "Instructions":
 import re as _re
 
 # --- Helper function for filename creation ---
+def get_contact_page_url(website):
+    if pd.isna(website) or not str(website).startswith("http"):
+        return ""
+    return website.rstrip("/") + "/contact"
+
 def create_filename(prefix, business_type, states, is_new=False):
     import re
     clean_type = re.sub(r'\W+', '_', business_type.strip().lower())
@@ -117,6 +122,8 @@ def create_filename(prefix, business_type, states, is_new=False):
     return f"{'new_' if is_new else ''}{prefix}_{suffix}"
 
 if page == "Lead Finder":
+    # --- Test Mode Checkbox ---
+    test_mode = st.sidebar.checkbox("🧪 Enable Test Mode (for fast testing)")
     st.title("🔍 Lead Finder")
     st.markdown("<p style='color:#888;'>Enter a type of business and select the states you'd like to search. This tool will generate a list of relevant businesses using the Google Maps API.</p>", unsafe_allow_html=True)
 
@@ -149,14 +156,17 @@ if page == "Lead Finder":
         if search_summary not in st.session_state.search_history:
             st.session_state.search_history.append(search_summary)
 
-    # Add search_depth slider for top N cities per state
-    search_depth = st.slider(
-        "Search Depth (cities per state)",
-        min_value=1,
-        max_value=25,
-        value=5,
-        help="Select how many top cities in each state to search for this business type."
-    )
+    # Add search_depth logic with test mode
+    if test_mode:
+        search_depth = 3
+    else:
+        search_depth = st.slider(
+            "Search Depth (cities per state)",
+            min_value=1,
+            max_value=25,
+            value=5,
+            help="Select how many top cities in each state to search for this business type."
+        )
 
     # Pagination option (default to False)
     paginate_results = st.checkbox(
@@ -193,44 +203,17 @@ if page == "Lead Finder":
                 st.stop()
             API_KEY = os.getenv("GOOGLE_API_KEY")
 
-            def search_places(query, location, api_key, use_pagination=False):
-                url = f"https://maps.googleapis.com/maps/api/place/textsearch/json"
-                params = {
-                    "query": f"{query} in {location}",
-                    "key": api_key
-                }
-                results = []
-                for _ in range(3 if use_pagination else 1):
-                    response = requests.get(url, params=params)
-                    data = response.json()
-                    results.extend(data.get("results", []))
-                    if "next_page_token" in data:
-                        params["pagetoken"] = data["next_page_token"]
-                        time.sleep(2)  # Required delay for next_page_token to activate
-                    else:
-                        break
-                return results
-
-            def get_place_details(place_id, api_key):
-                details_url = "https://maps.googleapis.com/maps/api/place/details/json"
-                params = {
-                    "place_id": place_id,
-                    "fields": "formatted_phone_number,website",
-                    "key": api_key
-                }
-                response = requests.get(details_url, params=params)
-                if response.status_code == 200:
-                    return response.json().get("result", {})
-                return {}
 
             leads = []
 
             with st.spinner(f"⏳ Searching... this may take some time."):
                 search_terms = [business_type]
-                if "dentist" in business_type.lower():
-                    search_terms.extend(["dental office", "dental clinic", "family dentist"])  # Example variant expansion
-                elif "school" in business_type.lower():
-                    search_terms.extend(["elementary school", "middle school", "high school", "academy"])
+                # Only expand variants if not in test mode
+                if not test_mode:
+                    if "dentist" in business_type.lower():
+                        search_terms.extend(["dental office", "dental clinic", "family dentist"])
+                    elif "school" in business_type.lower():
+                        search_terms.extend(["elementary school", "middle school", "high school", "academy"])
 
                 for state in states:
                     # Get top N cities for the state, fallback to state name if not found
@@ -239,9 +222,35 @@ if page == "Lead Finder":
                     for city in cities_to_search:
                         for term in search_terms:
                             with st.spinner(f"Searching {term} in {city}, {state}..."):
-                                query_results = search_places(term, f"{city}, {state}", API_KEY, use_pagination=paginate_results)
-                                st.session_state.api_calls += 1
-                                save_api_usage(st.session_state.api_calls)
+                                # Smart caching: normalize common business types
+                                normalization_map = {
+                                    "dental office": "dentist",
+                                    "dental clinic": "dentist",
+                                    "family dentist": "dentist",
+                                    "elementary school": "school",
+                                    "middle school": "school",
+                                    "high school": "school",
+                                    "academy": "school"
+                                }
+                                normalized_term = normalization_map.get(term.lower(), term.lower())
+
+                                cache_key = f"{normalized_term}_{city.lower().replace(' ', '')}_{state.lower().replace(' ', '')}"
+                                cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
+                                cache_path = os.path.join("cache", f"{cache_hash}.json")
+
+                                if not os.path.exists("cache"):
+                                    os.makedirs("cache")
+
+                                if os.path.exists(cache_path):
+                                    with open(cache_path, "r") as f:
+                                        query_results = json.load(f)
+                                else:
+                                    query_results = search_places(term, f"{city}, {state}", API_KEY, use_pagination=paginate_results)
+                                    with open(cache_path, "w") as f:
+                                        json.dump(query_results, f)
+                                    st.session_state.api_calls += 1
+                                    save_api_usage(st.session_state.api_calls)
+                                # for result in query_results:
                                 for result in query_results:
                                     place_id = result.get("place_id")
                                     phone = ""
@@ -315,237 +324,21 @@ if page == "Lead Finder":
 
                 # Save results to session state for persistent view
                 st.session_state.lead_results = df
-
-                # ---- Always display as DataFrame preview (CSV-like format) ----
-                if "lead_results" in st.session_state:
-                    df = st.session_state.lead_results
-                    st.dataframe(df)
             else:
                 st.warning("⚠️ No leads were found. Please check your search term or selected states.")
 
-elif page == "Email Scraper":
-    st.title("📇 Direct Contact Search")
-    uploaded_file = st.file_uploader(
-        "Upload a CSV file of leads to find direct contacts, emails, and contact pages.",
-        type=["csv"]
-    )
-    if uploaded_file is not None:
-        try:
-            df = pd.read_csv(uploaded_file)
-            st.success(f"✅ Loaded {len(df)} rows.")
-            st.write("📊 Preview:", df.head())
 
-            if "Website" not in df.columns:
-                st.error("❌ The uploaded CSV does not contain a 'Website' column.")
-            else:
-                if st.button("🔍 Start Email Scraping"):
-                    import openai
-                    openai_api_key = os.getenv("OPENAI_API_KEY")
-                    if not openai_api_key:
-                        openai_api_key = st.text_input("Enter your OpenAI API Key", type="password")
-                        if openai_api_key:
-                            os.environ["OPENAI_API_KEY"] = openai_api_key
-                    openai.api_key = os.getenv("OPENAI_API_KEY")
+#
+# ---- Sidebar Lead Summary ----
+if "lead_results" in st.session_state:
+    df = st.session_state.lead_results
+    new_count = (df["Status"] == "New").sum()
+    existing_count = (df["Status"] == "Already Harvested").sum()
 
-                    # Remove unused enrichment options UI
-
-                    contact_names = []
-                    job_titles = []
-                    direct_emails = []
-                    fallback_used = []
-                    contact_page_urls = []
-
-                    # Helper to extract email addresses from a web page
-                    def extract_emails_from_text(text):
-                        return re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
-
-                    # Helper to perform Google search and parse result text for contact info
-                    def google_search_and_extract_contact(query):
-                        from googlesearch import search
-                        headers = {"User-Agent": "Mozilla/5.0"}
-                        # Try up to 5 results
-                        for url in search(query, num_results=5, advanced=True):
-                            url_lower = url.lower()
-                            # Only look at likely contact/people/leadership/about/team pages
-                            if any(x in url_lower for x in ["contact", "team", "leadership", "about", "staff"]):
-                                try:
-                                    res = requests.get(url, timeout=8, headers=headers)
-                                    if res.status_code == 200:
-                                        soup = BeautifulSoup(res.text, "html.parser")
-                                        for s in soup(["script", "style"]):
-                                            s.decompose()
-                                        text = soup.get_text(separator=" ", strip=True)
-                                        # Try to find Owner, Marketing Director, or General Manager in the text
-                                        contact_priority = [("Owner",), ("Marketing Director",), ("General Manager",)]
-                                        found_contacts = []
-                                        for pri_titles in contact_priority:
-                                            pattern = r"([A-Z][a-z]+ [A-Z][a-z]+)[^\n]{0,40}(" + "|".join([re.escape(t) for t in pri_titles]) + r")[^\n]{0,40}([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})?"
-                                            matches = re.findall(pattern, text)
-                                            for match in matches:
-                                                name = match[0]
-                                                title = match[1]
-                                                email = match[2] if match[2] else ""
-                                                found_contacts.append((name, title, email))
-                                            if found_contacts:
-                                                # Return the first found for this priority
-                                                return found_contacts[0][0], found_contacts[0][1], found_contacts[0][2]
-                                        # If not found with above, try line-by-line fallback
-                                        lines = text.splitlines()
-                                        for pri_titles in contact_priority:
-                                            for line in lines:
-                                                for pri in pri_titles:
-                                                    if pri.lower() in line.lower():
-                                                        name_match = re.search(r"([A-Z][a-z]+ [A-Z][a-z]+)", line)
-                                                        email_match = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", line)
-                                                        name = name_match.group(1) if name_match else ""
-                                                        email = email_match.group(0) if email_match else ""
-                                                        return name, pri, email
-                                        # Fallback: just extract any email
-                                        emails = extract_emails_from_text(text)
-                                        if emails:
-                                            return "", "", emails[0]
-                                except Exception:
-                                    continue
-                        return "", "", ""
-
-                    # Helper to get the business contact page URL
-                    def get_contact_page_url(website):
-                        if not isinstance(website, str) or not website:
-                            return ""
-                        # Try contact page
-                        for suffix in ["/contact", "/contact-us", "/about", "/team"]:
-                            url = website.rstrip("/") + suffix
-                            try:
-                                r = requests.get(url, timeout=5)
-                                if r.status_code == 200:
-                                    return url
-                            except Exception:
-                                continue
-                        # Fallback to website itself
-                        return website
-
-                    progress = st.progress(0)
-                    for i, row in df.iterrows():
-                        website = row.get("Website", "")
-                        business_name = row.get("Business Name", "")
-                        address = row.get("Address", "")
-                        found_name = ""
-                        found_title = ""
-                        found_email = ""
-                        used_fallback = "N"
-                        contact_page_url = ""
-                        # If website missing or invalid, mark all as not found
-                        if pd.isna(website) or not str(website).startswith("http"):
-                            contact_names.append("")
-                            job_titles.append("")
-                            direct_emails.append("")
-                            fallback_used.append("Y")
-                            contact_page_urls.append("")
-                            progress.progress((i + 1) / len(df))
-                            continue
-                        # Build prioritized search queries
-                        location = ""
-                        if pd.notna(address):
-                            location = address
-                        queries = [
-                            f'Owner of {business_name} {location}',
-                            f'Marketing Director of {business_name} {location}',
-                            f'General Manager of {business_name} {location}',
-                            f'Contact {business_name} {location}',
-                        ]
-                        for query in queries:
-                            name, title, email = google_search_and_extract_contact(query)
-                            if email:
-                                found_email = email
-                                found_name = name
-                                found_title = title
-                                break
-                        if found_email:
-                            used_fallback = "N"
-                            contact_page_url = ""
-                        else:
-                            # Fallback: try to extract any email from the website contact/about page
-                            try:
-                                headers = {"User-Agent": "Mozilla/5.0"}
-                                for suffix in ["/contact", "/about", "/team"]:
-                                    url = website.rstrip("/") + suffix
-                                    r = requests.get(url, timeout=6, headers=headers)
-                                    if r.status_code == 200:
-                                        soup = BeautifulSoup(r.text, "html.parser")
-                                        for s in soup(["script", "style"]):
-                                            s.decompose()
-                                        text = soup.get_text(separator=" ", strip=True)
-                                        emails = extract_emails_from_text(text)
-                                        if emails:
-                                            found_email = emails[0]
-                                            used_fallback = "Y"
-                                            break
-                                if not found_email:
-                                    # Try homepage
-                                    r = requests.get(website, timeout=6, headers=headers)
-                                    if r.status_code == 200:
-                                        soup = BeautifulSoup(r.text, "html.parser")
-                                        for s in soup(["script", "style"]):
-                                            s.decompose()
-                                        text = soup.get_text(separator=" ", strip=True)
-                                        emails = extract_emails_from_text(text)
-                                        if emails:
-                                            found_email = emails[0]
-                                            used_fallback = "Y"
-                            except Exception:
-                                pass
-                            # Try to find a contact page URL even if no email found
-                            contact_page_url = get_contact_page_url(website)
-                        contact_names.append(found_name)
-                        job_titles.append(found_title)
-                        direct_emails.append(found_email)
-                        fallback_used.append(used_fallback)
-                        contact_page_urls.append(contact_page_url)
-                        progress.progress((i + 1) / len(df))
-                        time.sleep(1)
-
-                    # Build output DataFrame in the specified column order
-                    output_df = pd.DataFrame({
-                        "Business Name": df.get("Business Name", ""),
-                        "Website": df.get("Website", ""),
-                        "Contact Name": contact_names,
-                        "Job Title": job_titles,
-                        "Direct Contact Email": direct_emails,
-                        "Fallback Used (Y/N)": fallback_used,
-                        "Business Contact Page URL": contact_page_urls,
-                    })
-                    output_df = output_df[
-                        [
-                            "Business Name",
-                            "Website",
-                            "Contact Name",
-                            "Job Title",
-                            "Direct Contact Email",
-                            "Fallback Used (Y/N)",
-                            "Business Contact Page URL",
-                        ]
-                    ]
-                    output = io.StringIO()
-                    output_df.to_csv(output, index=False)
-                    output.seek(0)
-                    st.success("✅ Scraping and enrichment complete. Download your file below.")
-                    # --- Export filename logic for direct contact search ---
-                    filename = uploaded_file.name
-                    parts = filename.replace(".csv", "").split("_in_")
-                    if len(parts) == 2:
-                        biz, states = parts
-                        enriched_name = f"direct_contacts_{states}_{biz}.csv"
-                    else:
-                        enriched_name = "direct_contacts_enriched.csv"
-                    st.download_button(
-                        "📥 Download CSV with Enriched Contacts",
-                        output.getvalue(),
-                        file_name=enriched_name,
-                        mime="text/csv"
-                    )
-        except Exception as e:
-            st.error(f"❌ Failed to read file: {e}")
-
+    st.sidebar.markdown("### 📊 Lead Summary")
+    st.sidebar.markdown(f"- Total Leads: **{len(df)}**")
+    st.sidebar.markdown(f"- 🆕 New: **{new_count}**")
+    st.sidebar.markdown(f"- ♻️ Already Harvested: **{existing_count}**")
 
 
 # ---- API usage tracker (simple text version) ----
@@ -558,3 +351,25 @@ if api_usage >= API_LIMIT:
 # Footer attribution (default Streamlit style)
 st.sidebar.markdown("---")
 st.sidebar.markdown("Built by Olivia Burnett")
+def extract_emails_from_text(text):
+    obfuscated_patterns = [
+        r'[\w\.-]+@[\w\.-]+\.\w+',
+        r'[\w\.-]+\s?\[\s?at\s?\]\s?[\w\.-]+\s?\[\s?dot\s?\]\s?\w+',
+        r'[\w\.-]+\s?\(?\s?at\s?\)?\s?[\w\.-]+\s?\(?\s?dot\s?\)?\s?\w+'
+    ]
+    emails = []
+    for pattern in obfuscated_patterns:
+        matches = re.findall(pattern, text, flags=re.IGNORECASE)
+        for match in matches:
+            cleaned = (match
+                       .replace("[at]", "@")
+                       .replace("(at)", "@")
+                       .replace(" at ", "@")
+                       .replace("[dot]", ".")
+                       .replace("(dot)", ".")
+                       .replace(" dot ", ".")
+                       .replace(" ", "")
+                       .strip())
+            if cleaned not in emails:
+                emails.append(cleaned)
+    return emails
