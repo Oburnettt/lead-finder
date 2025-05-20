@@ -7,30 +7,31 @@ import io
 import os
 import hashlib
 import json
+# Load scraper role config
+with open("scraper_config.json", "r") as f:
+    ROLE_CONFIG = json.load(f)
 from dotenv import load_dotenv
 from search import search_places, get_place_details
 from enrich import scrape_contact_info_from_site, extract_email_from_text, extract_name_and_title_from_text
 load_dotenv()
 
-# --- Persistent API usage tracking ---
-USAGE_FILE = "usage_log.txt"
+USAGE_FILE = "api_usage_real.json"
 
 def load_api_usage():
     if os.path.exists(USAGE_FILE):
         with open(USAGE_FILE, "r") as f:
-            return int(f.read().strip())
-    return 0
+            return json.load(f)
+    return {"actual": 0, "estimated": 0}
 
-def save_api_usage(count):
+def save_api_usage(usage_dict):
     with open(USAGE_FILE, "w") as f:
-        f.write(str(count))
+        json.dump(usage_dict, f)
 
-# Load persistent usage at startup (initialize to 39 if file not present)
+# Session state: load persistent usage at startup
+if "api_usage" not in st.session_state:
+    st.session_state.api_usage = load_api_usage()
 if "api_calls" not in st.session_state:
-    usage = load_api_usage()
-    if usage == 0:
-        usage = 39
-    st.session_state.api_calls = usage
+    st.session_state.api_calls = 0
 
 if "view_mode" not in st.session_state:
     st.session_state.view_mode = "table"
@@ -40,6 +41,7 @@ st.set_page_config(page_title="Direct Contact Search")
 PAGES = {
     "Lead Finder": "🔍 Lead Finder",
     "Lead Database": "📁 Lead Database",
+    "Enrich Contacts": "👤 Enrich Contacts",
     "Instructions": "❓ Help"
 }
 
@@ -56,6 +58,8 @@ if st.sidebar.button("🔍 Lead Finder"):
     st.session_state.page = "Lead Finder"
 if st.sidebar.button("📁 Lead Database"):
     st.session_state.page = "Lead Database"
+if st.sidebar.button("👤 Enrich Contacts"):
+    st.session_state.page = "Enrich Contacts"
 if st.sidebar.button("❓ Help"):
     st.session_state.page = "Instructions"
 
@@ -71,57 +75,219 @@ use_threading = st.sidebar.checkbox(
 st.sidebar.markdown("<div style='height:40vh;'></div>", unsafe_allow_html=True)
 
 API_LIMIT = 11000
-api_usage = st.session_state.api_calls if "api_calls" in st.session_state else 0
 
 page = st.session_state.page
 
-if page == "Instructions":
+if page == "Enrich Contacts":
+    st.title("👤 Enrich Contacts")
+
+    uploaded_file = st.file_uploader("Upload a CSV of business leads to enrich", type=["csv"])
+    if uploaded_file:
+        df = pd.read_csv(uploaded_file)
+
+        st.success(f"Uploaded {len(df)} businesses for enrichment.")
+        st.info("This is a placeholder. Enrichment code will run here in the next step.")
+
+        # Begin enrichment process
+        enriched_rows = []
+        fallback_rows = []
+
+        for idx, row in df.iterrows():
+            name, title = "", ""
+            email, phone = "", ""
+            linkedin = ""
+            website = row.get("Website", "")
+            business_name = row.get("Business Name", "")
+            fallback_notes = ""
+
+            # Determine relevant titles from the config
+            industry = business_name.lower()
+            matched_roles = []
+
+            for key in ROLE_CONFIG.get("titles_by_industry", {}):
+                if key in industry:
+                    matched_roles = ROLE_CONFIG["titles_by_industry"][key]
+                    break
+            if not matched_roles:
+                matched_roles = ["owner", "manager", "director"]
+
+            if website and isinstance(website, str) and website.startswith("http"):
+                try:
+                    contact_info = scrape_contact_info_from_site(website, matched_roles)
+
+                    name = contact_info.get("name", "")
+                    title = contact_info.get("title", "")
+                    email = contact_info.get("email", "")
+                    phone = contact_info.get("phone", "")
+
+                    if not email and not phone and name:
+                        linkedin = f"https://www.google.com/search?q=site:linkedin.com/in+%22{name}%22+%22{business_name}%22"
+
+                    if name or title or email or phone:
+                        enriched_rows.append({
+                            "Business Name": business_name,
+                            "Name": name,
+                            "Title": title,
+                            "Email": email,
+                            "Phone": phone,
+                            "LinkedIn": linkedin,
+                            "Website": website,
+                            "Source": "Website"
+                        })
+                    else:
+                        fallback_rows.append({
+                            "Business Name": business_name,
+                            "Phone": row.get("Phone", ""),
+                            "Website": website,
+                            "Email": contact_info.get("business_email", ""),
+                            "Contact Page": contact_info.get("contact_page", ""),
+                            "Notes": "No direct contact found"
+                        })
+
+                except Exception as e:
+                    fallback_rows.append({
+                        "Business Name": business_name,
+                        "Phone": row.get("Phone", ""),
+                        "Website": website,
+                        "Email": "",
+                        "Contact Page": "",
+                        "Notes": f"Error scraping site: {str(e)}"
+                    })
+            else:
+                fallback_rows.append({
+                    "Business Name": business_name,
+                    "Phone": row.get("Phone", ""),
+                    "Website": website,
+                    "Email": "",
+                    "Contact Page": "",
+                    "Notes": "No website listed"
+                })
+
+        enriched_contacts = pd.DataFrame(enriched_rows)
+        fallback_info = pd.DataFrame(fallback_rows)
+
+        st.success(f"✅ Enriched {len(enriched_contacts)} contacts.")
+        st.info(f"ℹ️ {len(fallback_info)} leads used fallback general business info.")
+
+        # Display download options for enrichment outputs
+        st.download_button("📥 Download Verified Contacts (.csv)", enriched_contacts.to_csv(index=False), file_name="verified_contacts.csv", mime="text/csv")
+        st.download_button("📥 Download General Info (.csv)", fallback_info.to_csv(index=False), file_name="general_business_info.csv", mime="text/csv")
+
+        try:
+            import openpyxl
+            from io import BytesIO
+
+            def to_excel_download(df1, df2):
+                output = BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    df1.to_excel(writer, sheet_name='Verified Contacts', index=False)
+                    df2.to_excel(writer, sheet_name='General Info', index=False)
+                output.seek(0)
+                return output
+
+            excel_data = to_excel_download(enriched_contacts, fallback_info)
+            st.download_button("📥 Download Combined (.xlsx)", data=excel_data, file_name="enriched_results.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        except Exception as e:
+            st.warning("Excel export not available. Missing openpyxl module.")
+
+elif page == "Instructions":
     st.title("❓ Help")
     st.markdown("""
-    Welcome to the **Lead Finder & Contact Search Tool** — built to help marketing and sales teams identify qualified business leads and find the right people to contact.
+<style>
+.help-section h4 {
+    margin-top: 1.5em;
+    color: #f0f0f0;
+}
+.help-section ul {
+    padding-left: 1.2em;
+}
+.help-section li {
+    margin-bottom: 0.5em;
+}
+</style>
 
-    ### ✅ How to Use:
+<div class="help-section">
 
-    1. **Go to 🔍 Lead Finder**
-       - Enter a business type (e.g., "dentist", "funeral home")
-       - Select one or more states
-       - Optionally set filters or adjust how many cities to search
-       - Click **Search**
-       - Download either all leads or just new ones
+## 🧭 How to Use This Tool
 
-    2. **Go to 📇 Direct Contact Search**
-       - Upload your downloaded CSV
-       - Click **Start Email Scraping**
-       - The tool will enrich leads with:
-         - Contact names
-         - Likely emails
-         - LinkedIn search links
-         - Confidence scores
-       - Download the enriched list
+### 🔍 Lead Finder Tab
 
-    ---
+Use this tab to search for businesses in specific industries and states.
 
-    ### ❓ FAQ
+**Steps to run a search:**
+- Enter a business type (e.g., dentist, school)
+- Select one or more U.S. states
+- Adjust filters and advanced options as needed
+- Click **Search**
 
-    **Q: Will this tool find every business in a state?**  
-    A: No — it finds top results using Google’s Places API. It’s designed for quality and speed, not exhaustive scraping.
+---
 
-    **Q: Why are some emails blank?**  
-    A: If the tool can’t find a direct contact or a usable format, it leaves the field blank or falls back to a scraped general email.
+## ⚙️ Filters and Advanced Options
 
-    **Q: What’s a LinkedIn search link?**  
-    A: It opens a Google search targeting LinkedIn profiles based on the contact’s name and company.
+### 🔽 Filter Leads
+These help clean your results:
 
-    **Q: How do I know if an email is good?**  
-    A: Use the **Confidence Score** field and avoid emails marked as fallback-only or low confidence.
+- **📞 Only show leads with a phone number**  
+  Use this if you plan to call businesses.  
+  _Skip if you only need email or website data._
 
-    **Q: How many leads can I get per month?**  
-    A: The free tier supports up to ~11,000 API calls/month. Your usage is tracked below.
+- **🌐 Only show leads with a website**  
+  Useful if you want to research the business further.  
+  _Uncheck to include more small/local businesses._
 
-    ---
+---
 
-    Built by **Olivia Burnett**
-    """, unsafe_allow_html=True)
+### 🔧 Advanced Options
+
+- **📄 Get More Leads Per City**  
+  Searches more Google result pages per city.  
+  _Use this if your results seem limited or you're in a large market._  
+  _Not needed for quick tests or small states._
+
+- **☑️ Explore More Cities**  
+  Skips previously searched cities and expands your reach.  
+  _Helpful for repeat searches or lead expansion over time._
+
+- **⚡ Enable Fast Search (Threaded)**  
+  Speeds up the process using multi-threading.  
+  _Use if you have a solid internet connection._  
+  _Avoid if you’re close to your monthly API limit._
+
+- **🧪 Test Mode**  
+  Runs a short version of the search (3 cities per state).  
+  _Use this to preview results without using many API calls._
+
+---
+
+## 📁 Lead Database Tab
+
+View, filter, and export the leads you've collected.
+
+### 🔍 Filter Leads
+- Filter by **state** or **business type**
+- Select specific leads to download
+
+### 🕓 Previous Searches
+- Revisit past searches
+- Download or delete them
+- Preview before exporting
+
+---
+
+## 🧾 Extra Notes
+
+- Your monthly API usage is tracked in the sidebar (limit: **11,000** calls)
+- Duplicate leads are flagged as **Already Harvested**
+- Each lead includes:
+  - Name, Phone, Website, Address
+  - Search term + state
+
+---
+
+</div>
+
+Built with love by **Olivia Burnett**
+""", unsafe_allow_html=True)
 
 elif page == "Lead Database":
     st.title("📁 Lead Database")
@@ -449,6 +615,8 @@ if page == "Lead Finder":
         estimated_per_term = 3 if paginate_results else 1
         estimated_total_calls = estimated_term_count * estimated_city_count * estimated_per_term
 
+        st.session_state.api_usage["estimated"] += estimated_total_calls
+        save_api_usage(st.session_state.api_usage)
         st.info(f"🔍 Estimated API calls for this search: **{estimated_total_calls:,}**")
 
     if st.button("Search", disabled=disabled):
@@ -475,8 +643,6 @@ if page == "Lead Finder":
                         search_terms.extend(["elementary school", "middle school", "high school", "academy"])
 
         def search_city(city):
-            if "api_calls" not in st.session_state:
-                st.session_state.api_calls = 0
             city_leads = []
             for term in search_terms:
                 with st.spinner(f"Searching {term} in {city}, {state}..."):
@@ -504,9 +670,8 @@ if page == "Lead Finder":
                         query_results = search_places(term, f"{city}, {state}", API_KEY, use_pagination=paginate_results)
                         with open(cache_path, "w") as f:
                             json.dump(query_results, f)
-                        st.session_state.api_calls += 1
-                        api_usage = st.session_state.api_calls  # Update tracker variable immediately
-                        save_api_usage(api_usage)
+                        st.session_state.api_usage["actual"] += 1
+                        save_api_usage(st.session_state.api_usage)
 
             for result in query_results:
                 place_id = result.get("place_id")
@@ -638,11 +803,17 @@ if page == "Lead Finder":
         st.sidebar.markdown("### 🔁 Recent Searches")
         st.sidebar.markdown("<ul>" + "".join([f"<li>{query}</li>" for query in st.session_state.search_history[-5:]]) + "</ul>", unsafe_allow_html=True)
 
+    # Ensure api_calls is initialized before usage/credit block
+    if "api_calls" not in st.session_state:
+        st.session_state.api_calls = 0
     # Move API usage and credit explicitly to the very bottom, with horizontal rule and bottom container
     with st.sidebar.container():
         st.sidebar.markdown("<hr>", unsafe_allow_html=True)
-        st.sidebar.markdown(f"**API Usage:** {api_usage:,} / {API_LIMIT:,}")
-        if api_usage >= API_LIMIT:
+        usage = st.session_state.api_usage
+        st.sidebar.markdown(f"**Actual API Usage:** {usage['actual']:,}")
+        st.sidebar.markdown(f"**Estimated Usage (Projected):** {usage['estimated']:,}")
+        st.sidebar.markdown(f"**Remaining Credit Estimate:** ~{300 - usage['actual'] * 0.017:.2f} USD")
+        if usage["actual"] >= API_LIMIT:
             st.sidebar.error("🚫 Monthly API limit reached!")
         st.sidebar.markdown("Built by Olivia Burnett")
 def extract_emails_from_text(text):
@@ -667,3 +838,4 @@ def extract_emails_from_text(text):
             if cleaned not in emails:
                 emails.append(cleaned)
     return emails
+
