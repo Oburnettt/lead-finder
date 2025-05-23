@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from search import search_places, get_place_details
 from enrich import scrape_contact_info_from_site, extract_email_from_text
 load_dotenv()
+API_KEY = os.getenv("GOOGLE_API_KEY")
 
 USAGE_FILE = "api_usage_real.json"
 
@@ -564,7 +565,7 @@ if page == "Lead Finder":
             if st.session_state.api_calls >= API_LIMIT:
                 st.error(f"🚫 API usage limit ({API_LIMIT:,}) reached for the month. Please try again after your usage resets.")
                 st.stop()
-            API_KEY = os.getenv("GOOGLE_API_KEY")
+            # API_KEY is now loaded from the environment at the top of the script
 
             leads = []
 
