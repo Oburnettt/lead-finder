@@ -12,7 +12,7 @@ with open("scraper_config.json", "r") as f:
     ROLE_CONFIG = json.load(f)
 from dotenv import load_dotenv
 from search import search_places, get_place_details
-from enrich import scrape_contact_info_from_site, extract_email_from_text, extract_name_and_title_from_text
+from enrich import scrape_contact_info_from_site, extract_email_from_text
 load_dotenv()
 
 USAGE_FILE = "api_usage_real.json"
@@ -86,109 +86,46 @@ if page == "Enrich Contacts":
         df = pd.read_csv(uploaded_file)
 
         st.success(f"Uploaded {len(df)} businesses for enrichment.")
-        st.info("This is a placeholder. Enrichment code will run here in the next step.")
 
-        # Begin enrichment process
         enriched_rows = []
-        fallback_rows = []
 
-        for idx, row in df.iterrows():
-            name, title = "", ""
-            email, phone = "", ""
-            linkedin = ""
-            website = row.get("Website", "")
-            business_name = row.get("Business Name", "")
-            fallback_notes = ""
+        with st.spinner("🔄 Enriching contact info. Please wait..."):
+            for idx, row in df.iterrows():
+                website = row.get("Website", "")
+                business_name = row.get("Business Name", "")
+                phone = row.get("Phone", "")
 
-            # Determine relevant titles from the config
-            industry = business_name.lower()
-            matched_roles = []
+                industry = business_name.lower()
+                matched_roles = []
+                for key in ROLE_CONFIG.get("titles_by_industry", {}):
+                    if key in industry:
+                        matched_roles = ROLE_CONFIG["titles_by_industry"][key]
+                        break
+                if not matched_roles:
+                    matched_roles = ["owner", "manager", "director"]
 
-            for key in ROLE_CONFIG.get("titles_by_industry", {}):
-                if key in industry:
-                    matched_roles = ROLE_CONFIG["titles_by_industry"][key]
-                    break
-            if not matched_roles:
-                matched_roles = ["owner", "manager", "director"]
+                contact_info = scrape_contact_info_from_site(website, matched_roles)
 
-            if website and isinstance(website, str) and website.startswith("http"):
-                try:
-                    contact_info = scrape_contact_info_from_site(website, matched_roles)
-
-                    name = contact_info.get("name", "")
-                    title = contact_info.get("title", "")
-                    email = contact_info.get("email", "")
-                    phone = contact_info.get("phone", "")
-
-                    if not email and not phone and name:
-                        linkedin = f"https://www.google.com/search?q=site:linkedin.com/in+%22{name}%22+%22{business_name}%22"
-
-                    if name or title or email or phone:
-                        enriched_rows.append({
-                            "Business Name": business_name,
-                            "Name": name,
-                            "Title": title,
-                            "Email": email,
-                            "Phone": phone,
-                            "LinkedIn": linkedin,
-                            "Website": website,
-                            "Source": "Website"
-                        })
-                    else:
-                        fallback_rows.append({
-                            "Business Name": business_name,
-                            "Phone": row.get("Phone", ""),
-                            "Website": website,
-                            "Email": contact_info.get("business_email", ""),
-                            "Contact Page": contact_info.get("contact_page", ""),
-                            "Notes": "No direct contact found"
-                        })
-
-                except Exception as e:
-                    fallback_rows.append({
-                        "Business Name": business_name,
-                        "Phone": row.get("Phone", ""),
-                        "Website": website,
-                        "Email": "",
-                        "Contact Page": "",
-                        "Notes": f"Error scraping site: {str(e)}"
-                    })
-            else:
-                fallback_rows.append({
+                enriched_rows.append({
                     "Business Name": business_name,
-                    "Phone": row.get("Phone", ""),
-                    "Website": website,
-                    "Email": "",
-                    "Contact Page": "",
-                    "Notes": "No website listed"
+                    "Phone Number": phone,
+                    "Website": f"[Visit Website]({website})" if website else "",
+                    "Business Email": contact_info.get("business_email", ""),
+                    "Direct Contacts": contact_info.get("direct_contacts", "No direct contact found")
                 })
 
         enriched_contacts = pd.DataFrame(enriched_rows)
-        fallback_info = pd.DataFrame(fallback_rows)
+        st.success(f"✅ Enriched {len(enriched_contacts)} businesses.")
+        st.dataframe(enriched_contacts)
 
-        st.success(f"✅ Enriched {len(enriched_contacts)} contacts.")
-        st.info(f"ℹ️ {len(fallback_info)} leads used fallback general business info.")
+        from datetime import datetime
+        filename_base = uploaded_file.name.replace(".csv", "").replace(" ", "_").lower()
+        search_term = filename_base.split("_")[0] if "_" in filename_base else filename_base
+        search_state = filename_base.split("_")[1] if "_" in filename_base and len(filename_base.split("_")) > 1 else "unknown"
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        output_filename = f"{search_term}_{search_state}_enriched_contacts_{date_str}.csv"
 
-        # Display download options for enrichment outputs
-        st.download_button("📥 Download Verified Contacts (.csv)", enriched_contacts.to_csv(index=False), file_name="verified_contacts.csv", mime="text/csv")
-        st.download_button("📥 Download General Info (.csv)", fallback_info.to_csv(index=False), file_name="general_business_info.csv", mime="text/csv")
-
-        try:
-            import openpyxl
-            from io import BytesIO
-
-            def to_excel_download(df1, df2):
-                output = BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    df1.to_excel(writer, sheet_name='Verified Contacts', index=False)
-                    df2.to_excel(writer, sheet_name='General Info', index=False)
-                output.seek(0)
-                return output
-
-            excel_data = to_excel_download(enriched_contacts, fallback_info)
-            st.download_button("📥 Download Combined (.xlsx)", data=excel_data, file_name="enriched_results.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        except Exception as e:
-            st.warning("Excel export not available. Missing openpyxl module.")
+        st.download_button("📥 Download Enriched Contacts (.csv)", enriched_contacts.to_csv(index=False), file_name=output_filename, mime="text/csv")
 
 elif page == "Instructions":
     st.title("❓ Help")
